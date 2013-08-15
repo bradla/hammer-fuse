@@ -5,18 +5,19 @@
 #include <time.h>
 
 #ifndef BOOT2
+/*
 struct blockentry {
     hammer_off_t    off;
     int     use;
     char        *data;
-};
+}; */
 
 #ifdef TESTING
 #define NUMCACHE    16
 #else
 #define NUMCACHE    6
 #endif
-
+/*
 struct hfs {
 #ifdef TESTING
     int     fd;
@@ -28,10 +29,12 @@ struct hfs {
     int     lru;
     struct blockentry cache[NUMCACHE];
 };
+*/
 #endif /* #ifndef BOOT2 */
 
-int hinit(struct hfs *);
-int hstat(struct hfs *, ino_t, struct stat *);
+static int hinit(struct hfs *);
+//int hstat(struct hfs *, ino_t, struct stat *);
+static int hstat(struct hfs *hfs, ino_t ino, struct stat* st)
 ino_t hlookup(struct hfs *hfs, const char *path);
 int hreaddir(struct hfs *, ino_t, int64_t *, struct dirent *);
 ssize_t hreadf(struct hfs *, ino_t, int64_t, int64_t, char *);

@@ -12,7 +12,7 @@
 # -lfuse_ino64 to link against fuse library with large ino_t
 
 CFLAGS=-Wall -std=c99 -DTESTING
-LDFLAGS=-lfuse_ino64
+LDFLAGS=-lfuse # _ino64
 
 UNAME := $(shell uname)
 
@@ -24,4 +24,5 @@ ifeq ($(UNAME), Darwin)
 	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_DARWIN_C_SOURCE -D__DARWIN_64_BIT_INO_T -I/usr/local/include/osxfuse
 endif
 
-fusehammer: hammerread.c fusehammer.c
+fusehammer: fusehammer.c
+# fusehammer: hammerread.c fusehammer.c

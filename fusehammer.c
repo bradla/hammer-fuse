@@ -7,9 +7,13 @@
 #include <stdlib.h>
 #include <sys/stat.h>    /* struct stat */
 #include <dirent.h>      /* struct dirent */
-#include "hammerread.h"
+#include "hammerread.c"
+/* #include "hammerread.h"
+*/
 
-static struct hfs hfs;
+//ino_t hlookup(struct hfs *hfs, const char *path);
+
+struct hfs hfs;
 
 static int hammer_getattr(const char *path, struct stat *stbuf)
 {

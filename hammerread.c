@@ -31,8 +31,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/lib/libstand/hammerread.c,v 1.2 2008/10/29 22:14:25 swildner Exp $
  */
 
 /*
@@ -50,10 +48,13 @@
 #define	LIBSTAND	1
 #endif
 
+#ifdef BOOT2
+#include "boot2.h"
+#else
 #include <sys/param.h>
-
 #include <stddef.h>
 #include <stdint.h>
+#endif
 
 #ifdef TESTING
 #include <sys/fcntl.h>
@@ -77,10 +78,10 @@
 #endif
 
 #include "hammer_disk.h"
-#include "hammerread.h"
+
+#define min(x, y) ((x) < (y) ? (x) : (y))
 
 #ifndef BOOT2
-#if 0
 struct blockentry {
 	hammer_off_t	off;
 	int		use;
@@ -101,10 +102,11 @@ struct hfs {
 #endif
 	hammer_off_t	root;
 	int64_t		buf_beg;
+	int64_t		last_dir_ino;
+	u_int8_t	last_dir_cap_flags;
 	int		lru;
 	struct blockentry cache[NUMCACHE];
 };
-#endif /* #if 0 */
 
 static void *
 hread(struct hfs *hfs, hammer_off_t off)
@@ -132,7 +134,7 @@ hread(struct hfs *hfs, hammer_off_t off)
 		ssize_t res = pread(hfs->fd, be->data, HAMMER_BUFSIZE,
 				    boff & HAMMER_OFF_SHORT_MASK);
 		if (res != HAMMER_BUFSIZE)
-			err(1, "short read on off %llx", boff);
+			err(1, "short read on off %ju", boff);
 #else	// libstand
 		size_t rlen;
 		int rv = hfs->f->f_dev->dv_strategy(hfs->f->f_devdata, F_READ,
@@ -149,22 +151,24 @@ hread(struct hfs *hfs, hammer_off_t off)
 
 #else	/* BOOT2 */
 
-struct dmadat {
-	char		secbuf[DEV_BSIZE];
+struct hammer_dmadat {
+	struct boot2_dmadat boot2;
 	char		buf[HAMMER_BUFSIZE];
 };
 
-static struct dmadat *dmadat;
+#define fsdmadat	((struct hammer_dmadat *)boot2_dmadat)
 
 struct hfs {
 	hammer_off_t	root;
+	int64_t		last_dir_ino;
+	u_int8_t	last_dir_cap_flags;
 	int64_t		buf_beg;
 };
 
 static void *
 hread(struct hfs *hfs, hammer_off_t off)
 {
-	char *buf = dmadat->buf;
+	char *buf = fsdmadat->buf;
 
 	hammer_off_t boff = off & ~HAMMER_BUFMASK64;
 	boff &= HAMMER_OFF_LONG_MASK;
@@ -434,11 +438,13 @@ hfind(struct hfs *hfs, hammer_base_elm_t key, hammer_base_elm_t end)
 	hammer_off_t nodeoff = hfs->root;
 	hammer_node_ondisk_t node;
 	hammer_btree_elm_t e = NULL;
+	int internal;
 
 loop:
 	node = hread(hfs, nodeoff);
 	if (node == NULL)
 		return (NULL);
+	internal = node->type == HAMMER_BTREE_TYPE_INTERNAL;
 
 #if DEBUG > 3
 	for (int i = 0; i < node->count; i++) {
@@ -446,11 +452,18 @@ loop:
 		hprintb(&node->elms[i].base);
 		printf("\n");
 	}
+	if (internal) {
+		printf("B: ");
+		hprintb(&node->elms[node->count].base);
+		printf("\n");
+	}
 #endif
 
 	n = hammer_btree_search_node(&search, node);
 
-	for (; n < node->count; n++) {
+	// In internal nodes, we cover the right boundary as well.
+	// If we hit it, we'll backtrack.
+	for (; n < node->count + internal; n++) {
 		e = &node->elms[n];
 		r = hammer_btree_cmp(&search, &e->base);
 
@@ -460,7 +473,7 @@ loop:
 
 	// unless we stopped right on the left side, we need to back off a bit
 	if (n > 0)
-		e = &node->elms[n - 1];
+		e = &node->elms[--n];
 
 #if DEBUG > 2
 	printf("  found: ");
@@ -468,7 +481,11 @@ loop:
 	printf("\n");
 #endif
 
-	if (node->type == HAMMER_BTREE_TYPE_INTERNAL) {
+	if (internal) {
+		// If we hit the right boundary, backtrack to
+		// the next higher level.
+		if (n == node->count)
+			goto backtrack;
 		nodeoff = e->internal.subtree_offset;
 		backtrack = (e+1)->base;
 		goto loop;
@@ -482,7 +499,7 @@ loop:
 	}
 
 	// Skip deleted elements
-	while (n <= node->count && e->base.delete_tid != 0) {
+	while (n < node->count && e->base.delete_tid != 0) {
 		e++;
 		n++;
 	}
@@ -490,7 +507,8 @@ loop:
 	// In the unfortunate event when there is no next
 	// element in this node, we repeat the search with
 	// a key beyond the right boundary
-	if (n > node->count) {
+	if (n == node->count) {
+backtrack:
 		search = backtrack;
 		nodeoff = hfs->root;
 
@@ -522,6 +540,44 @@ fail:
 	return (NULL);
 }
 
+/*
+ * Returns the directory entry localization field based on the directory
+ * inode's capabilities.
+ */
+static u_int32_t
+hdirlocalization(struct hfs *hfs, ino_t ino)
+{
+	struct hammer_base_elm key;
+
+	if (ino != hfs->last_dir_ino) {
+		bzero(&key, sizeof(key));
+		key.obj_id = ino;
+		key.localization = HAMMER_LOCALIZE_INODE;
+		key.rec_type = HAMMER_RECTYPE_INODE;
+		hammer_btree_leaf_elm_t e;
+		hammer_data_ondisk_t ed;
+
+		e = hfind(hfs, &key, &key);
+		if (e) {
+			ed = hread(hfs, e->data_offset);
+			if (ed) {
+				hfs->last_dir_ino = ino;
+				hfs->last_dir_cap_flags = ed->inode.cap_flags;
+			} else {
+				printf("hdirlocal: no inode data for %llx\n",
+					(long long)ino);
+			}
+		} else {
+			printf("hdirlocal: no inode entry for %llx\n",
+				(long long)ino);
+		}
+	}
+	if (hfs->last_dir_cap_flags & HAMMER_INODE_CAP_DIR_LOCAL_INO)
+		return(HAMMER_LOCALIZE_INODE);
+	else
+		return(HAMMER_LOCALIZE_MISC);
+}
+
 #ifndef BOOT2
 int
 hreaddir(struct hfs *hfs, ino_t ino, int64_t *off, struct dirent *de)
@@ -534,7 +590,7 @@ hreaddir(struct hfs *hfs, ino_t ino, int64_t *off, struct dirent *de)
 
 	bzero(&key, sizeof(key));
 	key.obj_id = ino;
-	key.localization = HAMMER_LOCALIZE_MISC;
+	key.localization = hdirlocalization(hfs, ino);
 	key.rec_type = HAMMER_RECTYPE_DIRENTRY;
 	key.key = *off;
 
@@ -576,7 +632,7 @@ hresolve(struct hfs *hfs, ino_t dirino, const char *name)
 
 	bzero(&key, sizeof(key));
 	key.obj_id = dirino;
-	key.localization = HAMMER_LOCALIZE_MISC;
+	key.localization = hdirlocalization(hfs, dirino);
 	key.key = hammer_directory_namekey(name, namel);
 	key.rec_type = HAMMER_RECTYPE_DIRENTRY;
 	end = key;
@@ -611,7 +667,7 @@ hresolve(struct hfs *hfs, ino_t dirino, const char *name)
 	return -1;
 }
 
-ino_t
+static ino_t
 hlookup(struct hfs *hfs, const char *path)
 {
 #if DEBUG > 2
@@ -647,7 +703,7 @@ hlookup(struct hfs *hfs, const char *path)
 
 
 #ifndef BOOT2
-int
+static int
 hstat(struct hfs *hfs, ino_t ino, struct stat* st)
 {
 	struct hammer_base_elm key;
@@ -760,44 +816,49 @@ hreadf(struct hfs *hfs, ino_t ino, int64_t off, int64_t len, char *buf)
 struct hfs hfs;
 
 static int
-hammerinit(void)
+boot2_hammer_init(void)
 {
-	if (dsk_meta)
-		return (0);
+	hammer_volume_ondisk_t volhead;
 
-	hammer_volume_ondisk_t volhead = hread(&hfs, HAMMER_ZONE_ENCODE(1, 0));
+	volhead = hread(&hfs, HAMMER_ZONE_ENCODE(1, 0));
 	if (volhead == NULL)
 		return (-1);
 	if (volhead->vol_signature != HAMMER_FSBUF_VOLUME)
 		return (-1);
 	hfs.root = volhead->vol0_btree_root;
 	hfs.buf_beg = volhead->vol_buf_beg;
-	dsk_meta++;
 	return (0);
 }
 
-static ino_t
-lookup(const char *path)
+static boot2_ino_t
+boot2_hammer_lookup(const char *path)
 {
-	hammerinit();
-
 	ino_t ino = hlookup(&hfs, path);
 
 	if (ino == -1)
 		ino = 0;
+
+	fs_off = 0;
+
 	return (ino);
 }
 
 static ssize_t
-fsread(ino_t ino, void *buf, size_t len)
+boot2_hammer_read(boot2_ino_t ino, void *buf, size_t len)
 {
-	hammerinit();
-
 	ssize_t rlen = hreadf(&hfs, ino, fs_off, len, buf);
 	if (rlen != -1)
 		fs_off += rlen;
 	return (rlen);
 }
+
+const struct boot2_fsapi boot2_hammer_api = {
+	.fsinit = boot2_hammer_init,
+	.fslookup = boot2_hammer_lookup,
+	.fsread = boot2_hammer_read
+};
+
+
 #endif
 
 int
@@ -881,7 +942,7 @@ hreadlink(struct hfs *hfs, ino_t ino, char *buf, size_t size)
 }
 
 #ifndef BOOT2
-int
+static int
 hinit(struct hfs *hfs)
 {
 #if DEBUG
@@ -898,24 +959,25 @@ hinit(struct hfs *hfs)
 #endif
 	}
 	hfs->lru = 0;
+	hfs->last_dir_ino = -1;
 
 	hammer_volume_ondisk_t volhead = hread(hfs, HAMMER_ZONE_ENCODE(1, 0));
-	if (volhead == NULL)
-		return (-1);
 
-#if 0
 #ifdef TESTING
-	printf("signature: %svalid\n",
-	       volhead->vol_signature != HAMMER_FSBUF_VOLUME ?
-			"in" :
-			"");
-	printf("name: %s\n", volhead->vol_name);
+	if (volhead) {
+		printf("signature: %svalid\n",
+		       volhead->vol_signature != HAMMER_FSBUF_VOLUME ?
+				"in" :
+				"");
+		printf("name: %s\n", volhead->vol_name);
+	}
 #endif
-#endif /* #if 0 */
 
-	if (volhead->vol_signature != HAMMER_FSBUF_VOLUME) {
-		for (int i = 0; i < NUMCACHE; i++)
+	if (volhead == NULL || volhead->vol_signature != HAMMER_FSBUF_VOLUME) {
+		for (int i = 0; i < NUMCACHE; i++) {
 			free(hfs->cache[i].data);
+			hfs->cache[i].data = NULL;
+		}
 		errno = ENODEV;
 		return (-1);
 	}
@@ -926,14 +988,18 @@ hinit(struct hfs *hfs)
 	return (0);
 }
 
-void
+static void
 hclose(struct hfs *hfs)
 {
 #if DEBUG
 	printf("hclose\n");
 #endif
-	for (int i = 0; i < NUMCACHE; i++)
-		free(hfs->cache[i].data);
+	for (int i = 0; i < NUMCACHE; i++) {
+		if (hfs->cache[i].data) {
+			free(hfs->cache[i].data);
+			hfs->cache[i].data = NULL;
+		}
+	}
 }
 #endif
 
@@ -948,14 +1014,15 @@ static int
 hammer_open(const char *path, struct open_file *f)
 {
 	struct hfile *hf = malloc(sizeof(*hf));
-	bzero(hf, sizeof(*hf));
 
+	bzero(hf, sizeof(*hf));
 	f->f_fsdata = hf;
 	hf->hfs.f = f;
 	f->f_offset = 0;
 
 	int rv = hinit(&hf->hfs);
 	if (rv) {
+		f->f_fsdata = NULL;
 		free(hf);
 		return (rv);
 	}
@@ -983,6 +1050,7 @@ fail:
 #if DEBUG
 	printf("hammer_open fail\n");
 #endif
+	f->f_fsdata = NULL;
 	hclose(&hf->hfs);
 	free(hf);
 	return (ENOENT);
@@ -993,9 +1061,11 @@ hammer_close(struct open_file *f)
 {
 	struct hfile *hf = f->f_fsdata;
 
-	hclose(&hf->hfs);
 	f->f_fsdata = NULL;
-	free(hf);
+	if (hf) {
+	    hclose(&hf->hfs);
+	    free(hf);
+	}
 	return (0);
 }
 
@@ -1079,7 +1149,7 @@ struct fs_ops hammer_fsops = {
 #endif	// LIBSTAND
 
 #ifdef TESTING
-#if 0
+/*
 int
 main(int argc, char **argv)
 {
@@ -1109,7 +1179,7 @@ main(int argc, char **argv)
 			continue;
 		}
 
-		printf("%s %d/%d %o %lld\n",
+		printf("%s %d/%d %o %jd\n",
 		       argv[i],
 		       st.st_uid, st.st_gid,
 		       st.st_mode, st.st_size);
@@ -1118,7 +1188,7 @@ main(int argc, char **argv)
 			int64_t off = 0;
 			struct dirent de;
 			while (hreaddir(&hfs, ino, &off, &de) == 0) {
-				printf("%s %d %llx\n",
+				printf("%s %d %jx\n",
 				       de.d_name, de.d_type, de.d_ino);
 			}
 		} else if (S_ISREG(st.st_mode)) {
@@ -1134,17 +1204,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	hclose(&hfs);
-
 	return 0;
 }
-#endif /* #if 0 */
+*/
 #endif
-
-// from hammer_subs.c
-void
-hammer_time_to_timespec(u_int64_t xtime, struct timespec *ts)
-{
-    ts->tv_sec = (unsigned long)(xtime / 1000000);
-    ts->tv_nsec = (unsigned int)(xtime % 1000000) * 1000L;
-}

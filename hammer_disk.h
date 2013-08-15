@@ -91,6 +91,13 @@
 #define HAMMER_OFF_LONG_REC_MASK 0x0FFFFFFFFF000000ULL /* recovery boundary */
 #define HAMMER_RECOVERY_BND	0x0000000001000000ULL
 
+#define HAMMER_OFF_BAD		((hammer_off_t)-1)
+
+/*
+ * The current limit of volumes that can make up a HAMMER FS
+ */
+#define HAMMER_MAX_VOLUMES	256
+
 /*
  * Hammer transction ids are 64 bit unsigned integers and are usually
  * synchronized with the time of day in nanoseconds.
@@ -128,6 +135,10 @@ typedef u_int32_t hammer_crc_t;
  * zone 9 (z,v,o):	Record		- actually zone-2 address
  * zone 10 (z,v,o):	Large-data	- actually zone-2 address
  * zone 15:		reserved for sanity
+ *
+ * layer1/layer2 direct map:
+ *	zzzzvvvvvvvvoooo oooooooooooooooo oooooooooooooooo oooooooooooooooo
+ *	----111111111111 1111112222222222 222222222ooooooo oooooooooooooooo
  */
 
 #define HAMMER_ZONE_RAW_VOLUME		0x1000000000000000ULL
@@ -193,8 +204,15 @@ typedef u_int32_t hammer_crc_t;
  * offset into a raw zone 2 offset.  Each layer handles 18 bits.  The 8M
  * large-block size is 23 bits so two layers gives us 23+18+18 = 59 bits
  * of address space.
+ *
+ * When using hinting for a blockmap lookup, the hint is lost when the
+ * scan leaves the HINTBLOCK, which is typically several LARGEBLOCK's.
+ * HINTBLOCK is a heuristic.
  */
+#define HAMMER_HINTBLOCK_SIZE		(HAMMER_LARGEBLOCK_SIZE * 4)
+#define HAMMER_HINTBLOCK_MASK64		((u_int64_t)HAMMER_HINTBLOCK_SIZE - 1)
 #define HAMMER_LARGEBLOCK_SIZE		(8192 * 1024)
+#define HAMMER_LARGEBLOCK_OVERFILL	(6144 * 1024)
 #define HAMMER_LARGEBLOCK_SIZE64	((u_int64_t)HAMMER_LARGEBLOCK_SIZE)
 #define HAMMER_LARGEBLOCK_MASK		(HAMMER_LARGEBLOCK_SIZE - 1)
 #define HAMMER_LARGEBLOCK_MASK64	((u_int64_t)HAMMER_LARGEBLOCK_SIZE - 1)
@@ -271,12 +289,20 @@ typedef struct hammer_blockmap_layer1 *hammer_blockmap_layer1_t;
 #define HAMMER_LAYER1_CRCSIZE	\
 	offsetof(struct hammer_blockmap_layer1, layer1_crc)
 
+/*
+ * layer2 entry for 8MB bigblock.
+ *
+ * NOTE: bytes_free is signed and can legally go negative if/when data
+ *	 de-dup occurs.  This field will never go higher than
+ *	 HAMMER_LARGEBLOCK_SIZE.  If exactly HAMMER_LARGEBLOCK_SIZE
+ *	 the big-block is completely free.
+ */
 struct hammer_blockmap_layer2 {
 	u_int8_t	zone;		/* typed allocation zone */
 	u_int8_t	unused01;
 	u_int16_t	unused02;
 	u_int32_t	append_off;	/* allocatable space index */
-	u_int32_t	bytes_free;	/* bytes free within this bigblock */
+	int32_t		bytes_free;	/* bytes free within this bigblock */
 	hammer_crc_t	entry_crc;
 };
 
@@ -324,7 +350,6 @@ typedef struct hammer_blockmap_layer2 *hammer_blockmap_layer2_t;
  * may be reserved.  The size of the undo fifo is usually set a newfs time
  * but can be adjusted if the filesystem is taken offline.
  */
-
 #define HAMMER_UNDO_LAYER2	128	/* max layer2 undo mapping entries */
 
 /*
@@ -349,6 +374,33 @@ typedef struct hammer_blockmap_layer2 *hammer_blockmap_layer2_t;
  * with a single atomic operation.  A larger transactional operation, such
  * as a remove(), may consist of several smaller atomic operations
  * representing raw meta-data operations.
+ *
+ *				HAMMER VERSION 4 CHANGES
+ *
+ * In HAMMER version 4 the undo structure alignment is reduced from 16384
+ * to 512 bytes in order to ensure that each 512 byte sector begins with
+ * a header.  The reserved01 field in the header is now a 32 bit sequence
+ * number.  This allows the recovery code to detect missing sectors
+ * without relying on the 32-bit crc and to definitively identify the current
+ * undo sequence space without having to rely on information from the volume
+ * header.  In addition, new REDO entries in the undo space are used to
+ * record write, write/extend, and transaction id updates.
+ *
+ * The grand result is:
+ *
+ * (1) The volume header no longer needs to be synchronized for most
+ *     flush and fsync operations.
+ *
+ * (2) Most fsync operations need only lay down REDO records
+ *
+ * (3) Data overwrite for nohistory operations covered by REDO records
+ *     can be supported (instead of rolling a new block allocation),
+ *     by rolling UNDO for the prior contents of the data.
+ *
+ *				HAMMER VERSION 5 CHANGES
+ *
+ * Hammer version 5 contains a minor adjustment making layer2's bytes_free
+ * field signed, allowing dedup to push it into the negative domain.
  */
 #define HAMMER_HEAD_ONDISK_SIZE		32
 #define HAMMER_HEAD_ALIGN		8
@@ -357,11 +409,16 @@ typedef struct hammer_blockmap_layer2 *hammer_blockmap_layer2_t;
 #define HAMMER_HEAD_DOALIGN(bytes)	\
 	(((bytes) + HAMMER_HEAD_ALIGN_MASK) & ~HAMMER_HEAD_ALIGN_MASK)
 
+#define HAMMER_UNDO_ALIGN		512
+#define HAMMER_UNDO_ALIGN64		((u_int64_t)512)
+#define HAMMER_UNDO_MASK		(HAMMER_UNDO_ALIGN - 1)
+#define HAMMER_UNDO_MASK64		(HAMMER_UNDO_ALIGN64 - 1)
+
 struct hammer_fifo_head {
 	u_int16_t hdr_signature;
 	u_int16_t hdr_type;
-	u_int32_t hdr_size;	/* aligned size of the whole mess */
-	u_int32_t reserved01;	/* (0) reserved for future use */
+	u_int32_t hdr_size;	/* Aligned size of the whole mess */
+	u_int32_t hdr_seq;	/* Sequence number */
 	hammer_crc_t hdr_crc;	/* XOR crc up to field w/ crc after field */
 };
 
@@ -380,11 +437,11 @@ typedef struct hammer_fifo_tail *hammer_fifo_tail_t;
  * Fifo header types.
  */
 #define HAMMER_HEAD_TYPE_PAD	(0x0040U|HAMMER_HEAD_FLAG_FREE)
-#define HAMMER_HEAD_TYPE_VOL	0x0041U		/* Volume (dummy header) */
-#define HAMMER_HEAD_TYPE_BTREE	0x0042U		/* B-Tree node */
+#define HAMMER_HEAD_TYPE_DUMMY	0x0041U		/* dummy entry w/seqno */
+#define HAMMER_HEAD_TYPE_42	0x0042U
 #define HAMMER_HEAD_TYPE_UNDO	0x0043U		/* random UNDO information */
-#define HAMMER_HEAD_TYPE_DELETE	0x0044U		/* record deletion */
-#define HAMMER_HEAD_TYPE_RECORD	0x0045U		/* Filesystem record */
+#define HAMMER_HEAD_TYPE_REDO	0x0044U		/* data REDO / fast fsync */
+#define HAMMER_HEAD_TYPE_45	0x0045U
 
 #define HAMMER_HEAD_FLAG_FREE	0x8000U		/* Indicates object freed */
 
@@ -397,6 +454,8 @@ typedef struct hammer_fifo_tail *hammer_fifo_tail_t;
 
 /*
  * Misc FIFO structures.
+ *
+ * UNDO - Raw meta-data media updates.
  */
 struct hammer_fifo_undo {
 	struct hammer_fifo_head	head;
@@ -406,11 +465,70 @@ struct hammer_fifo_undo {
 	/* followed by data */
 };
 
-typedef struct hammer_fifo_undo *hammer_fifo_undo_t;
-
-struct hammer_fifo_buf_commit {
-	hammer_off_t		undo_offset;
+/*
+ * REDO (HAMMER version 4+) - Logical file writes/truncates.
+ *
+ * REDOs contain information which will be duplicated in a later meta-data
+ * update, allowing fast write()+fsync() operations.  REDOs can be ignored
+ * without harming filesystem integrity but must be processed if fsync()
+ * semantics are desired.
+ *
+ * Unlike UNDOs which are processed backwards within the recovery span,
+ * REDOs must be processed forwards starting further back (starting outside
+ * the recovery span).
+ *
+ *	WRITE	- Write logical file (with payload).  Executed both
+ *		  out-of-span and in-span.  Out-of-span WRITEs may be
+ *		  filtered out by TERMs.
+ *
+ *	TRUNC	- Truncate logical file (no payload).  Executed both
+ *		  out-of-span and in-span.  Out-of-span WRITEs may be
+ *		  filtered out by TERMs.
+ *
+ *	TERM_*	- Indicates meta-data was committed (if out-of-span) or
+ *		  will be rolled-back (in-span).  Any out-of-span TERMs
+ *		  matching earlier WRITEs remove those WRITEs from
+ *		  consideration as they might conflict with a later data
+ *		  commit (which is not being rolled-back).
+ *
+ *	SYNC	- The earliest in-span SYNC (the last one when scanning
+ *		  backwards) tells the recovery code how far out-of-span
+ *		  it must go to run REDOs.
+ *
+ * NOTE: WRITEs do not always have matching TERMs even under
+ *	 perfect conditions because truncations might remove the
+ *	 buffers from consideration.  I/O problems can also remove
+ *	 buffers from consideration.
+ *
+ *	 TRUNCSs do not always have matching TERMs because several
+ *	 truncations may be aggregated together into a single TERM.
+ */
+struct hammer_fifo_redo {
+	struct hammer_fifo_head	head;
+	int64_t			redo_objid;	/* file being written */
+	hammer_off_t		redo_offset;	/* logical offset in file */
+	int32_t			redo_data_bytes;
+	u_int32_t		redo_flags;
+	u_int32_t		redo_localization;
+	u_int32_t		redo_reserved;
+	u_int64_t		redo_mtime;	/* set mtime */
 };
+
+#define HAMMER_REDO_WRITE	0x00000001
+#define HAMMER_REDO_TRUNC	0x00000002
+#define HAMMER_REDO_TERM_WRITE	0x00000004
+#define HAMMER_REDO_TERM_TRUNC	0x00000008
+#define HAMMER_REDO_SYNC	0x00000010
+
+union hammer_fifo_any {
+	struct hammer_fifo_head	head;
+	struct hammer_fifo_undo	undo;
+	struct hammer_fifo_redo	redo;
+};
+
+typedef struct hammer_fifo_redo *hammer_fifo_redo_t;
+typedef struct hammer_fifo_undo *hammer_fifo_undo_t;
+typedef union hammer_fifo_any *hammer_fifo_any_t;
 
 /*
  * Volume header types
@@ -527,12 +645,17 @@ typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
 	 sizeof(hammer_crc_t))
 
 #define HAMMER_VOL_VERSION_MIN		1	/* minimum supported version */
-#define HAMMER_VOL_VERSION_DEFAULT	1	/* newfs default version */
-#define HAMMER_VOL_VERSION_WIP		2	/* version >= this is WIP */
-#define HAMMER_VOL_VERSION_MAX		2	/* maximum supported version */
+#define HAMMER_VOL_VERSION_DEFAULT	6	/* newfs default version */
+#define HAMMER_VOL_VERSION_WIP		7	/* version >= this is WIP */
+#define HAMMER_VOL_VERSION_MAX		6	/* maximum supported version */
 
 #define HAMMER_VOL_VERSION_ONE		1
-#define HAMMER_VOL_VERSION_TWO		2
+#define HAMMER_VOL_VERSION_TWO		2	/* new dirent layout (2.3+) */
+#define HAMMER_VOL_VERSION_THREE	3	/* new snapshot layout (2.5+) */
+#define HAMMER_VOL_VERSION_FOUR		4	/* new undo/flush (2.5+) */
+#define HAMMER_VOL_VERSION_FIVE		5	/* dedup (2.9+) */
+#define HAMMER_VOL_VERSION_SIX		6	/* DIRHASH_ALG1 */
+
 /*
  * Record types are fairly straightforward.  The B-Tree includes the record
  * type in its index sort.
@@ -548,6 +671,8 @@ typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
 #define HAMMER_RECTYPE_EXT		0x0013	/* ext attributes */
 #define HAMMER_RECTYPE_FIX		0x0014	/* fixed attribute */
 #define HAMMER_RECTYPE_PFS		0x0015	/* PFS management */
+#define HAMMER_RECTYPE_SNAPSHOT		0x0016	/* Snapshot management */
+#define HAMMER_RECTYPE_CONFIG		0x0017	/* hammer cleanup config */
 #define HAMMER_RECTYPE_MOVED		0x8000	/* special recovery flag */
 #define HAMMER_RECTYPE_MAX		0xFFFF
 
@@ -631,12 +756,15 @@ struct hammer_inode_data {
 
 /*
  * Capability & implementation flags.
+ *
+ * DIR_LOCAL_INO - Use inode B-Tree localization for directory entries.
  */
 #define HAMMER_INODE_CAP_DIRHASH_MASK	0x03	/* directory: hash algorithm */
 #define HAMMER_INODE_CAP_DIRHASH_ALG0	0x00
 #define HAMMER_INODE_CAP_DIRHASH_ALG1	0x01
 #define HAMMER_INODE_CAP_DIRHASH_ALG2	0x02
 #define HAMMER_INODE_CAP_DIRHASH_ALG3	0x03
+#define HAMMER_INODE_CAP_DIR_LOCAL_INO	0x04	/* use inode localization */
 
 /*
  * A HAMMER directory entry associates a HAMMER filesystem object with a
@@ -689,6 +817,14 @@ struct hammer_symlink_data {
  *
  * sync_low_tid is not yet used but will represent the highest pruning
  * end-point, after which full history is available.
+ *
+ * We need to pack this structure making it equally sized on both 32-bit and
+ * 64-bit machines as it is part of struct hammer_ioc_mrecord_pfs which is
+ * send over the wire in hammer mirror operations. Only on 64-bit machines
+ * the size of this struct differ when packed or not. This leads us to the
+ * situation where old 64-bit systems (using the non-packed structure),
+ * which were never able to mirror to/from 32-bit systems, are now no longer
+ * able to mirror to/from newer 64-bit systems (using the packed structure).
  */
 struct hammer_pseudofs_data {
 	hammer_tid_t	sync_low_tid;	/* full history beyond this point */
@@ -718,6 +854,36 @@ typedef struct hammer_pseudofs_data *hammer_pseudofs_data_t;
 #define HAMMER_PFSD_DELETED	0x80000000
 
 /*
+ * Snapshot meta-data { Objid = HAMMER_OBJID_ROOT, Key = tid, rectype = SNAPSHOT }.
+ *
+ * Snapshot records replace the old <fs>/snapshots/<softlink> methodology.  Snapshot
+ * records are mirrored but may be independantly managed once they are laid down on
+ * a slave.
+ *
+ * NOTE: The b-tree key is signed, the tid is not, so callers must still sort the
+ *	 results.
+ *
+ * NOTE: Reserved fields must be zero (as usual)
+ */
+struct hammer_snapshot_data {
+	hammer_tid_t	tid;		/* the snapshot TID itself (== key) */
+	u_int64_t	ts;		/* real-time when snapshot was made */
+	u_int64_t	reserved01;
+	u_int64_t	reserved02;
+	char		label[64];	/* user-supplied description */
+	u_int64_t	reserved03[4];
+};
+
+/*
+ * Config meta-data { ObjId = HAMMER_OBJID_ROOT, Key = 0, rectype = CONFIG }.
+ *
+ * Used to store the hammer cleanup config.  This data is not mirrored.
+ */
+struct hammer_config_data {
+	char		text[1024];
+};
+
+/*
  * Rollup various structures embedded as record data
  */
 union hammer_data_ondisk {
@@ -725,6 +891,8 @@ union hammer_data_ondisk {
 	struct hammer_inode_data inode;
 	struct hammer_symlink_data symlink;
 	struct hammer_pseudofs_data pfsd;
+	struct hammer_snapshot_data snap;
+	struct hammer_config_data config;
 };
 
 typedef union hammer_data_ondisk *hammer_data_ondisk_t;
